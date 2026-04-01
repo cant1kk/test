@@ -15,13 +15,17 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 # Script version
-VERSION="1.0.0"
+VERSION="1.1.0"
 
 # Installation directory
 INSTALL_DIR="/opt/fptn"
 COMPOSE_FILE="$INSTALL_DIR/docker-compose.yml"
 ENV_FILE="$INSTALL_DIR/.env"
 DATA_DIR="$INSTALL_DIR/fptn-server-data"
+
+# Docker Compose command (will be set by detect_docker_compose_version)
+COMPOSE_CMD=""
+COMPOSE_VERSION=""
 
 #############################################################################
 # Utility Functions
@@ -83,6 +87,101 @@ prompt_yes_no() {
 }
 
 #############################################################################
+# Docker Compose Version Detection
+#############################################################################
+
+detect_docker_compose_version() {
+    log_info "Определение версии Docker Compose..."
+    
+    # Check for Docker Compose v2 (docker compose)
+    if docker compose version &>/dev/null; then
+        COMPOSE_CMD="docker compose"
+        COMPOSE_VERSION="v2"
+        local version=$(docker compose version --short 2>/dev/null || echo "unknown")
+        log_success "Обнаружен Docker Compose v2: $version"
+        return 0
+    fi
+    
+    # Check for Docker Compose v1 (docker-compose)
+    if command -v docker-compose &>/dev/null; then
+        COMPOSE_CMD="docker-compose"
+        COMPOSE_VERSION="v1"
+        local version=$(docker-compose --version 2>/dev/null | grep -oP '\d+\.\d+\.\d+' || echo "unknown")
+        log_warn "Обнаружен Docker Compose v1: $version (устаревшая версия)"
+        
+        # Suggest upgrade to v2
+        echo ""
+        log_warn "Docker Compose v1 устарел и больше не поддерживается с июля 2023 года."
+        log_info "Рекомендуется обновить до Docker Compose v2 для лучшей производительности и безопасности."
+        echo ""
+        
+        if prompt_yes_no "Хотите обновить Docker Compose до v2 сейчас?" "y"; then
+            upgrade_docker_compose_v2
+            return $?
+        else
+            log_info "Продолжаем с Docker Compose v1..."
+            return 0
+        fi
+    fi
+    
+    # Neither version found
+    log_error "Docker Compose не установлен"
+    return 1
+}
+
+upgrade_docker_compose_v2() {
+    log_info "Обновление Docker Compose до v2..."
+    
+    # Remove old docker-compose v1 if installed via pip or curl
+    if command -v docker-compose &>/dev/null; then
+        log_info "Удаление Docker Compose v1..."
+        
+        # Try to remove via pip
+        pip uninstall -y docker-compose 2>/dev/null || true
+        pip3 uninstall -y docker-compose 2>/dev/null || true
+        
+        # Remove binary if installed via curl
+        rm -f /usr/local/bin/docker-compose 2>/dev/null || true
+        rm -f /usr/bin/docker-compose 2>/dev/null || true
+    fi
+    
+    # Install Docker Compose v2 plugin
+    log_info "Установка Docker Compose v2..."
+    
+    apt-get update -qq
+    apt-get install -y -qq docker-compose-plugin
+    
+    # Verify installation
+    if docker compose version &>/dev/null; then
+        COMPOSE_CMD="docker compose"
+        COMPOSE_VERSION="v2"
+        local version=$(docker compose version --short 2>/dev/null || echo "unknown")
+        log_success "Docker Compose v2 успешно установлен: $version"
+        return 0
+    else
+        log_error "Не удалось установить Docker Compose v2"
+        log_info "Продолжаем с Docker Compose v1..."
+        COMPOSE_CMD="docker-compose"
+        COMPOSE_VERSION="v1"
+        return 1
+    fi
+}
+
+run_compose() {
+    local args="$@"
+    
+    if [ "$COMPOSE_VERSION" = "v2" ]; then
+        # Docker Compose v2: supports --env-file flag
+        cd "$INSTALL_DIR"
+        $COMPOSE_CMD --env-file "$ENV_FILE" $args
+    else
+        # Docker Compose v1: reads .env automatically from current directory
+        cd "$INSTALL_DIR"
+        $COMPOSE_CMD $args
+    fi
+}
+
+#############################################################################
 # System Requirements Check
 #############################################################################
 
@@ -130,6 +229,9 @@ install_docker() {
     
     if command -v docker &> /dev/null; then
         log_success "Docker уже установлен: $(docker --version)"
+        
+        # Detect Docker Compose version after Docker is confirmed
+        detect_docker_compose_version
         return 0
     fi
     
@@ -155,7 +257,7 @@ install_docker() {
       "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
       $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
     
-    # Install Docker Engine
+    # Install Docker Engine with Compose v2 plugin
     apt-get update -qq
     apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
     
@@ -164,6 +266,9 @@ install_docker() {
     systemctl enable docker
     
     log_success "Docker успешно установлен: $(docker --version)"
+    
+    # Detect Docker Compose version
+    detect_docker_compose_version
 }
 
 #############################################################################
@@ -371,15 +476,15 @@ generate_ssl_certificates() {
     mkdir -p "$DATA_DIR"
     
     # Generate private key
-    docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" run --rm fptn-server \
+    run_compose -f "$COMPOSE_FILE" run --rm fptn-server \
         sh -c "cd /etc/fptn && openssl genrsa -out server.key 2048" 2>/dev/null
     
     # Generate self-signed certificate
-    docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" run --rm fptn-server \
+    run_compose -f "$COMPOSE_FILE" run --rm fptn-server \
         sh -c "cd /etc/fptn && openssl req -new -x509 -key server.key -out server.crt -days 365 -subj '/C=US/ST=State/L=City/O=FPTN/CN=fptn-server'" 2>/dev/null
     
     # Get certificate fingerprint
-    local fingerprint=$(docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" run --rm fptn-server \
+    local fingerprint=$(run_compose -f "$COMPOSE_FILE" run --rm fptn-server \
         sh -c "openssl x509 -noout -fingerprint -md5 -in /etc/fptn/server.crt | cut -d'=' -f2 | tr -d ':' | tr 'A-F' 'a-f'" 2>/dev/null | tr -d '\r')
     
     log_success "SSL сертификаты созданы"
@@ -393,13 +498,12 @@ generate_ssl_certificates() {
 start_server() {
     log_info "Запуск FPTN VPN сервера..."
     
-    cd "$INSTALL_DIR"
-    docker compose --env-file "$ENV_FILE" up -d
+    run_compose up -d
     
     sleep 5
     
     # Check server status
-    if docker compose --env-file "$ENV_FILE" ps | grep -q "Up"; then
+    if run_compose ps | grep -q "Up"; then
         log_success "Сервер успешно запущен"
         return 0
     else
@@ -410,15 +514,13 @@ start_server() {
 
 stop_server() {
     log_info "Остановка FPTN VPN сервера..."
-    cd "$INSTALL_DIR"
-    docker compose --env-file "$ENV_FILE" down
+    run_compose down
     log_success "Сервер остановлен"
 }
 
 restart_server() {
     log_info "Перезапуск FPTN VPN сервера..."
-    cd "$INSTALL_DIR"
-    docker compose --env-file "$ENV_FILE" restart
+    run_compose restart
     log_success "Сервер перезапущен"
 }
 
@@ -426,13 +528,12 @@ server_status() {
     cd "$INSTALL_DIR"
     echo ""
     log_info "Статус FPTN VPN сервера:"
-    docker compose --env-file "$ENV_FILE" ps
+    run_compose ps
     echo ""
 }
 
 server_logs() {
-    cd "$INSTALL_DIR"
-    docker compose --env-file "$ENV_FILE" logs -f
+    run_compose logs -f
 }
 
 #############################################################################
@@ -453,8 +554,7 @@ add_user() {
     
     log_info "Добавление пользователя: $username (bandwidth: ${bandwidth}Mbps)..."
     
-    cd "$INSTALL_DIR"
-    docker compose --env-file "$ENV_FILE" exec fptn-server fptn-passwd --add-user "$username" --bandwidth "$bandwidth"
+    run_compose exec fptn-server fptn-passwd --add-user "$username" --bandwidth "$bandwidth"
     
     log_success "Пользователь $username добавлен"
 }
@@ -468,8 +568,7 @@ delete_user() {
     
     log_info "Удаление пользователя: $username..."
     
-    cd "$INSTALL_DIR"
-    docker compose --env-file "$ENV_FILE" exec fptn-server fptn-passwd --delete-user "$username"
+    run_compose exec fptn-server fptn-passwd --delete-user "$username"
     
     log_success "Пользователь $username удален"
 }
@@ -477,8 +576,7 @@ delete_user() {
 list_users() {
     log_info "Список пользователей:"
     
-    cd "$INSTALL_DIR"
-    docker compose --env-file "$ENV_FILE" exec fptn-server fptn-passwd --list-users
+    run_compose exec fptn-server fptn-passwd --list-users
 }
 
 generate_token() {
@@ -496,8 +594,7 @@ generate_token() {
     
     log_info "Генерация токена для пользователя: $username..."
     
-    cd "$INSTALL_DIR"
-    docker compose --env-file "$ENV_FILE" run --rm fptn-server \
+    run_compose run --rm fptn-server \
         token-generator --user "$username" --password "$password" --server-ip "$SERVER_IP" --port "$SERVER_PORT"
 }
 
@@ -510,8 +607,7 @@ change_password() {
     
     log_info "Изменение пароля для пользователя: $username..."
     
-    cd "$INSTALL_DIR"
-    docker compose --env-file "$ENV_FILE" exec fptn-server fptn-passwd --change-password "$username"
+    run_compose exec fptn-server fptn-passwd --change-password "$username"
     
     log_success "Пароль изменен для пользователя $username"
 }
@@ -576,7 +672,11 @@ EOF
     
     # Start monitoring stack
     cd "$INSTALL_DIR"
-    docker compose -f docker-compose.monitoring.yml up -d
+    if [ "$COMPOSE_VERSION" = "v2" ]; then
+        docker compose -f docker-compose.monitoring.yml up -d
+    else
+        docker-compose -f docker-compose.monitoring.yml up -d
+    fi
     
     log_success "Мониторинг настроен"
     log_info "Prometheus: http://$SERVER_IP:9090"
@@ -657,10 +757,10 @@ update_server() {
     backup_config
     
     # Pull latest image
-    docker compose --env-file "$ENV_FILE" pull
+    run_compose pull
     
     # Restart with new image
-    docker compose --env-file "$ENV_FILE" up -d
+    run_compose up -d
     
     log_success "Сервер обновлен до последней версии"
 }
@@ -682,12 +782,17 @@ uninstall_fptn() {
     # Stop and remove containers
     if [ -f "$COMPOSE_FILE" ]; then
         cd "$INSTALL_DIR"
-        docker compose --env-file "$ENV_FILE" down -v
+        run_compose down -v
     fi
     
     # Remove monitoring if exists
     if [ -f "$INSTALL_DIR/docker-compose.monitoring.yml" ]; then
-        docker compose -f "$INSTALL_DIR/docker-compose.monitoring.yml" down -v
+        cd "$INSTALL_DIR"
+        if [ "$COMPOSE_VERSION" = "v2" ]; then
+            docker compose -f docker-compose.monitoring.yml down -v
+        else
+            docker-compose -f docker-compose.monitoring.yml down -v
+        fi
     fi
     
     # Remove installation directory
