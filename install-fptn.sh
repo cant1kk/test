@@ -15,7 +15,7 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 # Script version
-VERSION="1.3.0"
+VERSION="1.3.1"
 
 # Installation directory
 INSTALL_DIR="/opt/fptn"
@@ -148,8 +148,53 @@ upgrade_docker_compose_v2() {
     # Install Docker Compose v2 plugin
     log_info "Установка Docker Compose v2..."
     
+    # Update package index
     apt-get update -qq
-    apt-get install -y -qq docker-compose-plugin
+    
+    # Try to install docker-compose-plugin
+    if apt-get install -y -qq docker-compose-plugin 2>/dev/null; then
+        log_success "Docker Compose v2 установлен через пакет"
+    else
+        log_warn "Пакет docker-compose-plugin недоступен, устанавливаем вручную..."
+        
+        # Install manually from GitHub releases
+        local DOCKER_COMPOSE_VERSION="v2.24.5"
+        local ARCH=$(uname -m)
+        
+        case "$ARCH" in
+            x86_64)
+                ARCH="x86_64"
+                ;;
+            aarch64)
+                ARCH="aarch64"
+                ;;
+            armv7l)
+                ARCH="armv7"
+                ;;
+            *)
+                log_error "Неподдерживаемая архитектура: $ARCH"
+                COMPOSE_CMD="docker-compose"
+                COMPOSE_VERSION="v1"
+                return 1
+                ;;
+        esac
+        
+        # Create plugin directory
+        mkdir -p /usr/local/lib/docker/cli-plugins
+        
+        # Download Docker Compose v2
+        log_info "Скачивание Docker Compose v2 для $ARCH..."
+        if curl -SL "https://github.com/docker/compose/releases/download/${DOCKER_COMPOSE_VERSION}/docker-compose-linux-${ARCH}" \
+            -o /usr/local/lib/docker/cli-plugins/docker-compose; then
+            chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+            log_success "Docker Compose v2 установлен вручную"
+        else
+            log_error "Не удалось скачать Docker Compose v2"
+            COMPOSE_CMD="docker-compose"
+            COMPOSE_VERSION="v1"
+            return 1
+        fi
+    fi
     
     # Verify installation
     if docker compose version &>/dev/null; then
