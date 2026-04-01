@@ -15,7 +15,7 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 # Script version
-VERSION="1.1.0"
+VERSION="1.2.0"
 
 # Installation directory
 INSTALL_DIR="/opt/fptn"
@@ -467,6 +467,31 @@ EOF
 }
 
 #############################################################################
+# Docker Image Management
+#############################################################################
+
+pull_docker_image() {
+    log_info "Проверка Docker образа FPTN..."
+    
+    # Check if image already exists
+    if docker images fptnvpn/fptn-vpn-server:latest --format "{{.Repository}}" | grep -q "fptnvpn/fptn-vpn-server"; then
+        log_success "Docker образ уже скачан"
+        return 0
+    fi
+    
+    log_info "Скачивание Docker образа fptnvpn/fptn-vpn-server:latest..."
+    log_warn "Это может занять несколько минут в зависимости от скорости интернета..."
+    
+    if docker pull fptnvpn/fptn-vpn-server:latest; then
+        log_success "Docker образ успешно скачан"
+        return 0
+    else
+        log_error "Не удалось скачать Docker образ"
+        return 1
+    fi
+}
+
+#############################################################################
 # SSL Certificate Generation
 #############################################################################
 
@@ -475,16 +500,28 @@ generate_ssl_certificates() {
     
     mkdir -p "$DATA_DIR"
     
+    # Check if certificates already exist
+    if [ -f "$DATA_DIR/server.key" ] && [ -f "$DATA_DIR/server.crt" ]; then
+        log_warn "SSL сертификаты уже существуют"
+        if ! prompt_yes_no "Пересоздать сертификаты?" "n"; then
+            log_info "Используем существующие сертификаты"
+            return 0
+        fi
+    fi
+    
+    log_info "Генерация приватного ключа..."
     # Generate private key
-    run_compose -f "$COMPOSE_FILE" run --rm fptn-server \
-        sh -c "cd /etc/fptn && openssl genrsa -out server.key 2048" 2>/dev/null
+    run_compose run --rm fptn-server \
+        sh -c "cd /etc/fptn && openssl genrsa -out server.key 2048"
     
+    log_info "Генерация самоподписанного сертификата..."
     # Generate self-signed certificate
-    run_compose -f "$COMPOSE_FILE" run --rm fptn-server \
-        sh -c "cd /etc/fptn && openssl req -new -x509 -key server.key -out server.crt -days 365 -subj '/C=US/ST=State/L=City/O=FPTN/CN=fptn-server'" 2>/dev/null
+    run_compose run --rm fptn-server \
+        sh -c "cd /etc/fptn && openssl req -new -x509 -key server.key -out server.crt -days 365 -subj '/C=US/ST=State/L=City/O=FPTN/CN=fptn-server'"
     
+    log_info "Получение отпечатка сертификата..."
     # Get certificate fingerprint
-    local fingerprint=$(run_compose -f "$COMPOSE_FILE" run --rm fptn-server \
+    local fingerprint=$(run_compose run --rm fptn-server \
         sh -c "openssl x509 -noout -fingerprint -md5 -in /etc/fptn/server.crt | cut -d'=' -f2 | tr -d ':' | tr 'A-F' 'a-f'" 2>/dev/null | tr -d '\r')
     
     log_success "SSL сертификаты созданы"
@@ -695,6 +732,7 @@ install_fptn() {
     configure_server
     create_env_file
     create_docker_compose
+    pull_docker_image
     generate_ssl_certificates
     start_server
     
