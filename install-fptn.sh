@@ -15,7 +15,7 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 # Script version
-VERSION="1.2.0"
+VERSION="1.3.0"
 
 # Installation directory
 INSTALL_DIR="/opt/fptn"
@@ -509,23 +509,40 @@ generate_ssl_certificates() {
         fi
     fi
     
-    log_info "Генерация приватного ключа..."
-    # Generate private key
-    run_compose run --rm fptn-server \
-        sh -c "cd /etc/fptn && openssl genrsa -out server.key 2048"
+    log_info "Генерация приватного ключа (это может занять несколько секунд)..."
+    # Generate private key with timeout
+    if ! timeout 60 run_compose run --rm fptn-server \
+        sh -c "cd /etc/fptn && openssl genrsa -out server.key 2048"; then
+        log_error "Не удалось сгенерировать приватный ключ (timeout или ошибка)"
+        log_info "Попробуйте запустить вручную: cd /opt/fptn && docker-compose run --rm fptn-server sh -c 'cd /etc/fptn && openssl genrsa -out server.key 2048'"
+        return 1
+    fi
     
     log_info "Генерация самоподписанного сертификата..."
-    # Generate self-signed certificate
-    run_compose run --rm fptn-server \
-        sh -c "cd /etc/fptn && openssl req -new -x509 -key server.key -out server.crt -days 365 -subj '/C=US/ST=State/L=City/O=FPTN/CN=fptn-server'"
+    # Generate self-signed certificate with timeout
+    if ! timeout 60 run_compose run --rm fptn-server \
+        sh -c "cd /etc/fptn && openssl req -new -x509 -key server.key -out server.crt -days 365 -subj '/C=US/ST=State/L=City/O=FPTN/CN=fptn-server'"; then
+        log_error "Не удалось сгенерировать сертификат (timeout или ошибка)"
+        log_info "Попробуйте запустить вручную: cd /opt/fptn && docker-compose run --rm fptn-server sh -c 'cd /etc/fptn && openssl req -new -x509 -key server.key -out server.crt -days 365 -subj \"/C=US/ST=State/L=City/O=FPTN/CN=fptn-server\"'"
+        return 1
+    fi
+    
+    # Verify certificates were created
+    if [ ! -f "$DATA_DIR/server.key" ] || [ ! -f "$DATA_DIR/server.crt" ]; then
+        log_error "SSL сертификаты не были созданы!"
+        log_info "Проверьте логи Docker: docker logs fptn-server"
+        return 1
+    fi
     
     log_info "Получение отпечатка сертификата..."
     # Get certificate fingerprint
-    local fingerprint=$(run_compose run --rm fptn-server \
+    local fingerprint=$(timeout 30 run_compose run --rm fptn-server \
         sh -c "openssl x509 -noout -fingerprint -md5 -in /etc/fptn/server.crt | cut -d'=' -f2 | tr -d ':' | tr 'A-F' 'a-f'" 2>/dev/null | tr -d '\r')
     
     log_success "SSL сертификаты созданы"
-    log_info "MD5 Fingerprint: $fingerprint"
+    if [ -n "$fingerprint" ]; then
+        log_info "MD5 Fingerprint: $fingerprint"
+    fi
 }
 
 #############################################################################
@@ -733,7 +750,20 @@ install_fptn() {
     create_env_file
     create_docker_compose
     pull_docker_image
-    generate_ssl_certificates
+    
+    # Generate SSL certificates
+    if ! generate_ssl_certificates; then
+        log_error "Не удалось сгенерировать SSL сертификаты"
+        echo ""
+        log_warn "Вы можете создать их вручную:"
+        echo "  cd /opt/fptn"
+        echo "  docker-compose run --rm fptn-server sh -c 'cd /etc/fptn && openssl genrsa -out server.key 2048'"
+        echo "  docker-compose run --rm fptn-server sh -c 'cd /etc/fptn && openssl req -new -x509 -key server.key -out server.crt -days 365 -subj \"/C=US/ST=State/L=City/O=FPTN/CN=fptn-server\"'"
+        echo "  docker-compose up -d"
+        echo ""
+        exit 1
+    fi
+    
     start_server
     
     echo ""
